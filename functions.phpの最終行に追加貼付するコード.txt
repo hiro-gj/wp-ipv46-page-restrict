@@ -1,0 +1,118 @@
+/**
+ * functions.php に貼り付ける想定の最小構成版
+ *
+ * 前提:
+ * - 同じディレクトリに `get_ip-and-slug_list.php` と `ip-check.php` を配置しておく
+ * - 固定ページ `ip_allowed` 本文に「slug => 許可IP(CIDR可)」を記載
+ * - 不一致の場合は /ipblock/ へリダイレクト
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// 必要関数が未読込なら同階層ファイルを読む（貼り付け運用でも破綻しにくくする）
+if (!function_exists('mw_get_ip_allowed_map')) {
+    $p = __DIR__ . '/get_ip-and-slug_list.php';
+    if (file_exists($p)) {
+        require_once $p;
+    }
+}
+if (!function_exists('mw_get_client_ips') || !function_exists('mw_client_is_allowed')) {
+    $p = __DIR__ . '/ip-check.php';
+    if (file_exists($p)) {
+        require_once $p;
+    }
+}
+
+add_action('template_redirect', static function (): void {
+    if (is_admin() || !is_singular()) {
+        return;
+    }
+
+    $obj = get_queried_object();
+    if (!$obj || empty($obj->post_name)) {
+        return;
+    }
+
+    $slug_raw = (string) $obj->post_name;
+
+    // URLがパーセントエンコードされる（日本語スラッグ等）ケースに備えて候補を作る
+    $slug_decoded = rawurldecode($slug_raw);
+
+    // ループ防止（この2ページはASCII前提）
+    if (in_array($slug_raw, ['ip_allowed', 'ipblock'], true)) {
+        return;
+    }
+
+    // 必須関数が揃っていないなら何もしない（致命エラー回避）
+    if (!function_exists('mw_get_ip_allowed_map') || !function_exists('mw_get_client_ips') || !function_exists('mw_client_is_allowed')) {
+        return;
+    }
+
+    $map = mw_get_ip_allowed_map('ip_allowed');
+
+    // slug側の不可視文字混入対策（念のため）
+    $slug_raw_norm = (string) preg_replace('/\p{Cf}+/u', '', trim($slug_raw));
+    $slug_decoded_norm = (string) preg_replace('/\p{Cf}+/u', '', trim($slug_decoded));
+
+    // 解析状況を debug.log に出す（WP_DEBUG && WP_DEBUG_LOG のときのみ）
+    $mw_ip_restrict_log = static function (string $label, $value): void {
+        // 未定義定数の参照を避ける（静的解析/非WP環境でも安全）
+        if (!defined('WP_DEBUG') || !constant('WP_DEBUG') || !defined('WP_DEBUG_LOG') || !constant('WP_DEBUG_LOG')) {
+            return;
+        }
+
+        if (function_exists('wp_json_encode')) {
+            $out = is_scalar($value) || $value === null
+                ? (string) $value
+                : (string) wp_json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        } else {
+            $out = is_scalar($value) || $value === null ? (string) $value : print_r($value, true);
+        }
+
+        error_log('[ip-restrict] ' . $label . ': ' . $out);
+    };
+
+    $mw_hex = static function ($s) {
+        return is_string($s) ? bin2hex($s) : null;
+    };
+
+    $mw_ip_restrict_log('slug_raw', $slug_raw);
+    $mw_ip_restrict_log('slug_decoded', $slug_decoded);
+    $mw_ip_restrict_log('slug_raw_norm', $slug_raw_norm);
+    $mw_ip_restrict_log('slug_decoded_norm', $slug_decoded_norm);
+    $mw_ip_restrict_log('map_keys', array_keys($map));
+
+    // post_name が %e8%a8... のように保存されている場合と、
+    // 設定が日本語（デコード済み）で書かれている場合の両方に対応
+    $allowed = $map[$slug_raw_norm] ?? $map[$slug_decoded_norm] ?? $map[$slug_raw] ?? $map[$slug_decoded] ?? null;
+
+    $mw_ip_restrict_log('allowed_raw', $allowed);
+    $mw_ip_restrict_log('allowed_hex', is_array($allowed) ? array_map($mw_hex, $allowed) : null);
+
+    // 対象スラッグ以外はスルー
+    if (!is_array($allowed) || !$allowed) {
+        return;
+    }
+
+    // external_check は既定OFF（外部通信を避ける）
+    $clientIps = mw_get_client_ips([
+        'external_check' => false,
+        'external_timeout' => 1,
+    ]);
+
+    if (mw_client_is_allowed($clientIps, $allowed)) {
+        return;
+    }
+
+    // まだPOSTでIPが送られてきていない場合、かつセッションにも情報がない（あるいは不足している）場合、
+    // JSによるチェックを試みる
+    if (($_SERVER['REQUEST_METHOD'] !== 'POST' || empty($_POST['mw_ip_denied_client_ip'])) && empty($_POST['mw_ip_denied_checked'])) {
+         mw_render_js_collector_page();
+    }
+
+    wp_safe_redirect(home_url('/ipblock/'));
+    exit;
+}, 1);
+
